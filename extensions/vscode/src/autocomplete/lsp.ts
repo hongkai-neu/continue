@@ -208,6 +208,34 @@ async function crawlTypes(
   return results;
 }
 
+async function getFunctionInfo(
+  uri: string,
+  position: vscode.Position
+): Promise<string> {
+  const hoverResult = await vscode.commands.executeCommand(
+    'vscode.executeHoverProvider',
+    vscode.Uri.parse(uri),
+    position
+  ) as vscode.Hover[];
+
+  if (hoverResult && hoverResult.length > 0) {
+    const hoverContent = hoverResult[0].contents[0];
+    if (typeof hoverContent === 'object' && 'value' in hoverContent) {
+      return hoverContent.value.trim();
+    }
+  }
+
+  return '';
+}
+
+function isRangeInFile(obj: any): obj is RangeInFile {
+  return obj && typeof obj.filepath === 'string' && obj.range && typeof obj.range === 'object';
+}
+
+function isRangeInFileWithContents(obj: any): obj is RangeInFileWithContents {
+  return isRangeInFile(obj) && 'contents' in obj && typeof obj.contents === 'string';
+}
+
 export async function getDefinitionsForNode(
   uri: string,
   node: Parser.SyntaxNode,
@@ -220,43 +248,28 @@ export async function getDefinitionsForNode(
     case "call_expression":
     case "call":
       {
-        console.log(`LSP: Getting function definition for call expression`);
-        const [funDef] = await executeGotoProvider({
-          uri,
-          line: node.startPosition.row,
-          character: node.startPosition.column,
-          name: "vscode.executeDefinitionProvider",
-        });
-        if (!funDef) {
-          console.log(`LSP: No function definition found`);
-          return [];
+        console.log(`LSP: Getting function info for call expression`);
+        const position = new vscode.Position(node.startPosition.row, node.startPosition.column);
+        const hoverInfo = await getFunctionInfo(uri, position);
+
+        if (hoverInfo) {
+          const range = {
+            start: { line: node.startPosition.row, character: node.startPosition.column },
+            end: { line: node.endPosition.row, character: node.endPosition.column }
+          };
+
+          ranges.push({
+            filepath: uri,
+            range: range,
+            contents: hoverInfo,
+          });
         }
 
-        // Fetch the entire file content
-        const fileContent = await ide.readFile(funDef.filepath);
-        const lines = fileContent.split('\n');
-
-        // Find the function definition start line
-        const defStartLine = funDef.range.start.line;
-
-        // Extract up to 16 lines (function signature + 15 lines)
-        const extractedLines = lines.slice(defStartLine, defStartLine + 16);
-        const extractedContent = extractedLines.join('\n');
-
-        ranges.push({
-          ...funDef,
-          contents: extractedContent,
-        });
-
         console.log(`LSP: Crawling types for function definition`);
-        const typeDefs = await crawlTypes(
-          {
-            ...funDef,
-            contents: extractedContent,
-          },
-          ide,
-        );
-        ranges.push(...typeDefs);
+        if (ranges.length > 0) {
+          const typeDefs = await crawlTypes(ranges[0], ide);
+          ranges.push(...typeDefs);
+        }
       }
       break;
 
@@ -331,17 +344,29 @@ export async function getDefinitionsForNode(
       console.log(`LSP: Unhandled node type: ${node.type}`);
       break;
   }
-  return await Promise.all(
+
+  return Promise.all(
     ranges.map(async (rif) => {
-      if (!isRifWithContents(rif)) {
+      if (isRangeInFileWithContents(rif)) {
+        return rif;
+      } else if (isRangeInFile(rif)) {
         console.log(`LSP: Fetching contents for range in file ${rif.filepath}`);
         return {
           ...rif,
           contents: await ide.readRangeInFile(rif.filepath, rif.range),
         };
+      } else {
+        console.warn(`LSP: Invalid range object`, rif);
+        return {
+          filepath: uri,
+          range: {
+            start: { line: 0, character: 0 },
+            end: { line: 0, character: 0 }
+          },
+          contents: '',
+        };
       }
-      return rif;
-    }),
+    })
   );
 }
 
