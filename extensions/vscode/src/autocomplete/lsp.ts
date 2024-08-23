@@ -38,6 +38,7 @@ export async function executeGotoProvider(
   const cacheKey = gotoInputKey(input);
   const cached = gotoCache.get(cacheKey);
   if (cached) {
+    console.log(`LSP: Using cached result for ${input.name}`);
     return cached;
   }
 
@@ -54,6 +55,8 @@ export async function executeGotoProvider(
         filepath: (d.targetUri || d.uri).fsPath,
         range: d.targetRange || d.range,
       }));
+
+    console.log(`LSP: ${input.name} returned ${results.length} results`);
 
     // Add to cache
     if (gotoCache.size >= MAX_CACHE_SIZE) {
@@ -124,10 +127,14 @@ async function crawlTypes(
   results: RangeInFileWithContents[] = [],
   searchedLabels: Set<string> = new Set(),
 ): Promise<RangeInFileWithContents[]> {
+  console.log(`LSP: Crawling types for ${rif.filepath}`);
+
   // Get the file contents if not already attached
   const contents = isRifWithContents(rif)
     ? rif.contents
     : await ide.readFile(rif.filepath);
+
+  console.log(`LSP: File contents fetched for ${rif.filepath}`);
 
   // Parse AST
   const ast = await getAst(rif.filepath, contents);
@@ -142,9 +149,12 @@ async function crawlTypes(
   // We deduplicate below to be sure, but this saves calls to the LSP
   identifierNodes.forEach((node) => searchedLabels.add(node.text));
 
+  console.log(`LSP: Found ${identifierNodes.length} type identifiers`);
+
   // Use LSP to get the definitions of those types
   const definitions = await Promise.all(
     identifierNodes.map(async (node) => {
+      console.log(`LSP: Getting definition for ${node.text}`);
       const [typeDef] = await executeGotoProvider({
         uri: rif.filepath,
         // TODO: tree-sitter is zero-indexed, but there seems to be an off-by-one
@@ -157,8 +167,11 @@ async function crawlTypes(
       });
 
       if (!typeDef) {
+        console.log(`LSP: No definition found for ${node.text}`);
         return undefined;
       }
+      console.log(`LSP: Definition found for ${node.text}`);
+      console.log(`LSP: Definition contents fetched for ${node.text}`);
       return {
         ...typeDef,
         contents: await ide.readRangeInFile(typeDef.filepath, typeDef.range),
@@ -183,6 +196,8 @@ async function crawlTypes(
     results.push(definition);
   }
 
+  console.log(`LSP: Added ${results.length} unique definitions`);
+
   // Recurse
   if (depth > 0) {
     for (const result of [...results]) {
@@ -199,75 +214,86 @@ export async function getDefinitionsForNode(
   ide: IDE,
   lang: AutocompleteLanguageInfo,
 ): Promise<RangeInFileWithContents[]> {
+  console.log(`LSP: Getting definitions for node type ${node.type}`);
   const ranges: (RangeInFile | RangeInFileWithContents)[] = [];
   switch (node.type) {
-    case "call_expression": {
-      // function call -> function definition
-      const [funDef] = await executeGotoProvider({
-        uri,
-        line: node.startPosition.row,
-        character: node.startPosition.column,
-        name: "vscode.executeDefinitionProvider",
-      });
-      if (!funDef) {
-        return [];
-      }
-
-      // Don't display a function of more than 15 lines
-      // We can of course do something smarter here eventually
-      let funcText = await ide.readRangeInFile(funDef.filepath, funDef.range);
-      if (funcText.split("\n").length > 15) {
-        let truncated = false;
-        const funRootAst = await getAst(funDef.filepath, funcText);
-        if (funRootAst) {
-          const [funNode] = findChildren(
-            funRootAst?.rootNode,
-            (node) => FUNCTION_DECLARATION_NODE_TYPEs.includes(node.type),
-            1,
-          );
-          if (funNode) {
-            const [statementBlockNode] = findChildren(
-              funNode,
-              (node) => FUNCTION_BLOCK_NODE_TYPES.includes(node.type),
-              1,
-            );
-            if (statementBlockNode) {
-              funcText = funRootAst.rootNode.text
-                .slice(0, statementBlockNode.startIndex)
-                .trim();
-              truncated = true;
-            }
-          }
+    case "call_expression":
+    case "call":
+      {
+        console.log(`LSP: Getting function definition for call expression`);
+        const [funDef] = await executeGotoProvider({
+          uri,
+          line: node.startPosition.row,
+          character: node.startPosition.column,
+          name: "vscode.executeDefinitionProvider",
+        });
+        if (!funDef) {
+          console.log(`LSP: No function definition found`);
+          return [];
         }
-        if (!truncated) {
-          funcText = funcText.split("\n")[0];
-        }
-      }
 
-      ranges.push(funDef);
+        // Fetch the entire file content
+        const fileContent = await ide.readFile(funDef.filepath);
+        const lines = fileContent.split('\n');
 
-      const typeDefs = await crawlTypes(
-        {
+        // Find the function definition start line
+        const defStartLine = funDef.range.start.line;
+
+        // Extract up to 16 lines (function signature + 15 lines)
+        const extractedLines = lines.slice(defStartLine, defStartLine + 16);
+        const extractedContent = extractedLines.join('\n');
+
+        ranges.push({
           ...funDef,
-          contents: funcText,
-        },
-        ide,
-      );
-      ranges.push(...typeDefs);
+          contents: extractedContent,
+        });
+
+        console.log(`LSP: Crawling types for function definition`);
+        const typeDefs = await crawlTypes(
+          {
+            ...funDef,
+            contents: extractedContent,
+          },
+          ide,
+        );
+        ranges.push(...typeDefs);
+      }
       break;
-    }
+
     case "variable_declarator":
-      // variable assignment -> variable definition/type
-      // usages of the var that appear after the declaration
+    case "assignment":
+      {
+        // variable assignment -> variable definition/type
+        const [varDef] = await executeGotoProvider({
+          uri,
+          line: node.startPosition.row,
+          character: node.startPosition.column,
+          name: "vscode.executeDefinitionProvider",
+        });
+        if (!varDef) {
+          console.log(`LSP: No variable definition found`);
+          return [];
+        }
+
+        const contents = await ide.readRangeInFile(varDef.filepath, varDef.range);
+        ranges.push({ ...varDef, contents });
+
+        // Optionally, you can crawl types for the variable as well
+        const typeDefs = await crawlTypes({ ...varDef, contents }, ide);
+        ranges.push(...typeDefs);
+      }
       break;
+
     case "impl_item":
       // impl of trait -> trait definition
+      console.log(`LSP: Impl item not implemented yet`);
       break;
     case "new_expression":
       // In 'new MyClass(...)', "MyClass" is the classNameNode
       const classNameNode = node.children.find(
         (child) => child.type === "identifier",
       );
+      console.log(`LSP: Getting class definition for new expression`);
       const [classDef] = await executeGotoProvider({
         uri,
         line: (classNameNode ?? node).endPosition.row,
@@ -275,33 +301,40 @@ export async function getDefinitionsForNode(
         name: "vscode.executeDefinitionProvider",
       });
       if (!classDef) {
+        console.log(`LSP: No class definition found`);
         break;
       }
       const contents = await ide.readRangeInFile(
         classDef.filepath,
         classDef.range,
       );
+      console.log(`LSP: Class definition contents fetched`);
 
       ranges.push({
         ...classDef,
-        contents: `${
-          classNameNode?.text
-            ? `${lang.singleLineComment} ${classNameNode.text}:\n`
-            : ""
-        }${contents.trim()}`,
+        contents: `${classNameNode?.text
+          ? `${lang.singleLineComment} ${classNameNode.text}:\n`
+          : ""
+          }${contents.trim()}`,
       });
 
+      console.log(`LSP: Crawling types for class definition`);
       const definitions = await crawlTypes({ ...classDef, contents }, ide);
       ranges.push(...definitions.filter(Boolean));
 
       break;
     case "":
       // function definition -> implementations?
+      console.log(`LSP: Empty node type not implemented yet`);
+      break;
+    default:
+      console.log(`LSP: Unhandled node type: ${node.type}`);
       break;
   }
   return await Promise.all(
     ranges.map(async (rif) => {
       if (!isRifWithContents(rif)) {
+        console.log(`LSP: Fetching contents for range in file ${rif.filepath}`);
         return {
           ...rif,
           contents: await ide.readRangeInFile(rif.filepath, rif.range),
@@ -326,14 +359,18 @@ export const getDefinitionsFromLsp: GetLspDefinitionsFunction = async (
   lang: AutocompleteLanguageInfo,
 ): Promise<AutocompleteSnippet[]> => {
   try {
+    console.log(`LSP: Getting definitions for ${filepath}`);
     const ast = await getAst(filepath, contents);
     if (!ast) return [];
 
     const treePath = await getTreePathAtCursor(ast, cursorIndex);
     if (!treePath) return [];
 
+    console.log(`LSP: Found ${treePath.length} nodes in tree path`);
+
     const results: RangeInFileWithContents[] = [];
     for (const node of treePath.reverse()) {
+      console.log(`LSP: Processing node of type ${node.type}`);
       const definitions = await getDefinitionsForNode(
         filepath,
         node,
@@ -343,6 +380,7 @@ export const getDefinitionsFromLsp: GetLspDefinitionsFunction = async (
       results.push(...definitions);
     }
 
+    console.log(`LSP: Returning ${results.length} definitions`);
     return results.map((result) => ({
       ...result,
       score: 0.8,
