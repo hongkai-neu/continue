@@ -179,8 +179,6 @@ async function crawlTypes(
     }),
   );
 
-  // TODO: Filter out if not in our code?
-
   // Filter out duplicates
   for (const definition of definitions) {
     if (
@@ -241,140 +239,49 @@ export async function getDefinitionsForNode(
   node: Parser.SyntaxNode,
   ide: IDE,
   lang: AutocompleteLanguageInfo,
+  cursorPosition: vscode.Position
 ): Promise<RangeInFileWithContents[]> {
   console.log(`LSP: Getting definitions for node type ${node.type}`);
-  const ranges: (RangeInFile | RangeInFileWithContents)[] = [];
+  const ranges: RangeInFileWithContents[] = [];
+
+  const MAX_DISTANCE = 5; // Maximum number of lines to consider
+
   switch (node.type) {
     case "call_expression":
     case "call":
       {
-        console.log(`LSP: Getting function info for call expression`);
-        const position = new vscode.Position(node.startPosition.row, node.startPosition.column);
-        const hoverInfo = await getFunctionInfo(uri, position);
+        const nodePosition = new vscode.Position(node.startPosition.row, node.startPosition.column);
+        const distance = Math.abs(nodePosition.line - cursorPosition.line);
 
-        if (hoverInfo) {
-          const range = {
-            start: { line: node.startPosition.row, character: node.startPosition.column },
-            end: { line: node.endPosition.row, character: node.endPosition.column }
-          };
+        if (distance <= MAX_DISTANCE) {
+          console.log(`LSP: Getting function info for nearby call expression`);
+          const hoverInfo = await getFunctionInfo(uri, nodePosition);
 
-          ranges.push({
-            filepath: uri,
-            range: range,
-            contents: hoverInfo,
-          });
-        }
+          if (hoverInfo) {
+            const range = {
+              start: { line: node.startPosition.row, character: node.startPosition.column },
+              end: { line: node.endPosition.row, character: node.endPosition.column }
+            };
 
-        console.log(`LSP: Crawling types for function definition`);
-        if (ranges.length > 0) {
-          const typeDefs = await crawlTypes(ranges[0], ide);
-          ranges.push(...typeDefs);
+            ranges.push({
+              filepath: uri,
+              range: range,
+              contents: hoverInfo,
+            });
+          }
         }
       }
       break;
 
-    case "variable_declarator":
-    case "assignment":
-      {
-        // variable assignment -> variable definition/type
-        const [varDef] = await executeGotoProvider({
-          uri,
-          line: node.startPosition.row,
-          character: node.startPosition.column,
-          name: "vscode.executeDefinitionProvider",
-        });
-        if (!varDef) {
-          console.log(`LSP: No variable definition found`);
-          return [];
-        }
+    // ... other cases can be added here if needed ...
 
-        const contents = await ide.readRangeInFile(varDef.filepath, varDef.range);
-        ranges.push({ ...varDef, contents });
-
-        // Optionally, you can crawl types for the variable as well
-        const typeDefs = await crawlTypes({ ...varDef, contents }, ide);
-        ranges.push(...typeDefs);
-      }
-      break;
-
-    case "impl_item":
-      // impl of trait -> trait definition
-      console.log(`LSP: Impl item not implemented yet`);
-      break;
-    case "new_expression":
-      // In 'new MyClass(...)', "MyClass" is the classNameNode
-      const classNameNode = node.children.find(
-        (child) => child.type === "identifier",
-      );
-      console.log(`LSP: Getting class definition for new expression`);
-      const [classDef] = await executeGotoProvider({
-        uri,
-        line: (classNameNode ?? node).endPosition.row,
-        character: (classNameNode ?? node).endPosition.column,
-        name: "vscode.executeDefinitionProvider",
-      });
-      if (!classDef) {
-        console.log(`LSP: No class definition found`);
-        break;
-      }
-      const contents = await ide.readRangeInFile(
-        classDef.filepath,
-        classDef.range,
-      );
-      console.log(`LSP: Class definition contents fetched`);
-
-      ranges.push({
-        ...classDef,
-        contents: `${classNameNode?.text
-          ? `${lang.singleLineComment} ${classNameNode.text}:\n`
-          : ""
-          }${contents.trim()}`,
-      });
-
-      console.log(`LSP: Crawling types for class definition`);
-      const definitions = await crawlTypes({ ...classDef, contents }, ide);
-      ranges.push(...definitions.filter(Boolean));
-
-      break;
-    case "":
-      // function definition -> implementations?
-      console.log(`LSP: Empty node type not implemented yet`);
-      break;
     default:
       console.log(`LSP: Unhandled node type: ${node.type}`);
       break;
   }
 
-  return Promise.all(
-    ranges.map(async (rif) => {
-      if (isRangeInFileWithContents(rif)) {
-        return rif;
-      } else if (isRangeInFile(rif)) {
-        console.log(`LSP: Fetching contents for range in file ${rif.filepath}`);
-        return {
-          ...rif,
-          contents: await ide.readRangeInFile(rif.filepath, rif.range),
-        };
-      } else {
-        console.warn(`LSP: Invalid range object`, rif);
-        return {
-          filepath: uri,
-          range: {
-            start: { line: 0, character: 0 },
-            end: { line: 0, character: 0 }
-          },
-          contents: '',
-        };
-      }
-    })
-  );
+  return ranges;
 }
-
-/**
- * and other stuff not directly on the path:
- * - variables defined on line above
- * ...etc...
- */
 
 export const getDefinitionsFromLsp: GetLspDefinitionsFunction = async (
   filepath: string,
@@ -393,6 +300,11 @@ export const getDefinitionsFromLsp: GetLspDefinitionsFunction = async (
 
     console.log(`LSP: Found ${treePath.length} nodes in tree path`);
 
+    const cursorPosition = new vscode.Position(
+      ast.rootNode.text.slice(0, cursorIndex).split('\n').length - 1,
+      cursorIndex - ast.rootNode.text.lastIndexOf('\n', cursorIndex - 1) - 1
+    );
+
     const results: RangeInFileWithContents[] = [];
     for (const node of treePath.reverse()) {
       console.log(`LSP: Processing node of type ${node.type}`);
@@ -401,6 +313,7 @@ export const getDefinitionsFromLsp: GetLspDefinitionsFunction = async (
         node,
         ide,
         lang,
+        cursorPosition
       );
       results.push(...definitions);
     }
