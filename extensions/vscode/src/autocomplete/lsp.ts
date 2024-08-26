@@ -4,10 +4,6 @@ import { GetLspDefinitionsFunction } from "core/autocomplete/completionProvider"
 import { AutocompleteLanguageInfo } from "core/autocomplete/languages";
 import { AutocompleteSnippet } from "core/autocomplete/ranking";
 import { RangeInFileWithContents } from "core/commands/util";
-import {
-  FUNCTION_BLOCK_NODE_TYPES,
-  FUNCTION_DECLARATION_NODE_TYPEs,
-} from "core/indexing/chunk/code";
 import { intersection } from "core/util/ranges";
 import * as vscode from "vscode";
 import type Parser from "web-tree-sitter";
@@ -127,14 +123,12 @@ async function crawlTypes(
   results: RangeInFileWithContents[] = [],
   searchedLabels: Set<string> = new Set(),
 ): Promise<RangeInFileWithContents[]> {
-  console.log(`LSP: Crawling types for ${rif.filepath}`);
 
   // Get the file contents if not already attached
   const contents = isRifWithContents(rif)
     ? rif.contents
     : await ide.readFile(rif.filepath);
 
-  console.log(`LSP: File contents fetched for ${rif.filepath}`);
 
   // Parse AST
   const ast = await getAst(rif.filepath, contents);
@@ -154,7 +148,6 @@ async function crawlTypes(
   // Use LSP to get the definitions of those types
   const definitions = await Promise.all(
     identifierNodes.map(async (node) => {
-      console.log(`LSP: Getting definition for ${node.text}`);
       const [typeDef] = await executeGotoProvider({
         uri: rif.filepath,
         // TODO: tree-sitter is zero-indexed, but there seems to be an off-by-one
@@ -167,11 +160,8 @@ async function crawlTypes(
       });
 
       if (!typeDef) {
-        console.log(`LSP: No definition found for ${node.text}`);
         return undefined;
       }
-      console.log(`LSP: Definition found for ${node.text}`);
-      console.log(`LSP: Definition contents fetched for ${node.text}`);
       return {
         ...typeDef,
         contents: await ide.readRangeInFile(typeDef.filepath, typeDef.range),
@@ -194,7 +184,6 @@ async function crawlTypes(
     results.push(definition);
   }
 
-  console.log(`LSP: Added ${results.length} unique definitions`);
 
   // Recurse
   if (depth > 0) {
@@ -234,7 +223,7 @@ function isRangeInFileWithContents(obj: any): obj is RangeInFileWithContents {
   return isRangeInFile(obj) && 'contents' in obj && typeof obj.contents === 'string';
 }
 
-export async function getDefinitionsForNode(
+async function getDefinitionsForNode(
   uri: string,
   node: Parser.SyntaxNode,
   ide: IDE,
@@ -246,38 +235,44 @@ export async function getDefinitionsForNode(
 
   const MAX_DISTANCE = 5; // Maximum number of lines to consider
 
-  switch (node.type) {
-    case "call_expression":
-    case "call":
-      {
-        const nodePosition = new vscode.Position(node.startPosition.row, node.startPosition.column);
-        const distance = Math.abs(nodePosition.line - cursorPosition.line);
+  if (node.type === "call_expression" || node.type === "call") {
 
-        if (distance <= MAX_DISTANCE) {
-          console.log(`LSP: Getting function info for nearby call expression`);
-          const hoverInfo = await getFunctionInfo(uri, nodePosition);
+    // Find the function or method name node
+    let nameNode: Parser.SyntaxNode | null = null;
 
-          if (hoverInfo) {
-            const range = {
-              start: { line: node.startPosition.row, character: node.startPosition.column },
-              end: { line: node.endPosition.row, character: node.endPosition.column }
-            };
+    // Check for method calls
+    const methodNode = node.childForFieldName('method');
+    if (methodNode) {
+      nameNode = methodNode;
+    } else {
+      // Check for function calls
+      const functionNode = node.childForFieldName('function');
+      if (functionNode) {
+        nameNode = functionNode.lastNamedChild || functionNode;
+      }
+    }
 
-            ranges.push({
-              filepath: uri,
-              range: range,
-              contents: hoverInfo,
-            });
-          }
+    if (nameNode) {
+      const nodePosition = new vscode.Position(nameNode.startPosition.row, nameNode.startPosition.column);
+      const distance = Math.abs(nodePosition.line - cursorPosition.line);
+
+      if (distance <= MAX_DISTANCE) {
+        const hoverInfo = await getFunctionInfo(uri, nodePosition);
+
+        if (hoverInfo) {
+          const range = {
+            start: { line: nameNode.startPosition.row, character: nameNode.startPosition.column },
+            end: { line: nameNode.endPosition.row, character: nameNode.endPosition.column }
+          };
+
+          ranges.push({
+            filepath: uri,
+            range: range,
+            contents: hoverInfo,
+          });
         }
       }
-      break;
-
-    // ... other cases can be added here if needed ...
-
-    default:
-      console.log(`LSP: Unhandled node type: ${node.type}`);
-      break;
+    }
   }
 
   return ranges;
@@ -307,7 +302,8 @@ export const getDefinitionsFromLsp: GetLspDefinitionsFunction = async (
 
     const results: RangeInFileWithContents[] = [];
     for (const node of treePath.reverse()) {
-      console.log(`LSP: Processing node of type ${node.type}`);
+      console.log(`LSP: Processing node of type ${node.type
+        } `);
       const definitions = await getDefinitionsForNode(
         filepath,
         node,
